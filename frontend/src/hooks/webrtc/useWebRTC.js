@@ -7,7 +7,7 @@ import { useEffect, useRef, useState } from "react";
  * backend's /offer endpoint and exposes the resulting remote MediaStream
  * so a <video> element can render it.
  *
- * @param {string} signalingUrl - e.g. "http://localhost:8000/offer"
+ * @param {string} signalingUrl - e.g. "http://localhost:8080/offer"
  */
 export function useWebRTC(signalingUrl) {
   const [stream, setStream] = useState(null);
