@@ -1,0 +1,12 @@
+venv/
+
+__pycache__/
+*.pyc
+
+.env
+
+videos/*.mp4
+
+models/*.engine
+models/*.onnx
+models/*.pt
