@@ -1,232 +1,481 @@
 #!/usr/bin/env python3
 
 """
-server.py — VisionEdge Week 1, Track B deliverable.
+server.py — VisionEdge WebRTC Streaming Server
 
-Minimal aiortc server that streams a static video file over WebRTC.
+Pipeline:
+
+React Frontend
+        |
+        ↓
+server.py (/offer)
+        |
+        ↓
+peer.py
+        |
+        ↓
+video_track.py
+        |
+        ↓
+services/inference_loop.py
+        |
+        ↓
+decoder.py
+        |
+        ↓
+preprocess.py
+        |
+        ↓
+TensorRT (optional)
 """
 
+
 import argparse
-import asyncio
 import json
 import logging
+import sys
+
+
 from pathlib import Path
 
+
+# -------------------------------------------------
+# Add backend folder to Python path
+# -------------------------------------------------
+
+BACKEND_DIR = Path(__file__).resolve().parents[1]
+
+sys.path.append(
+    str(BACKEND_DIR)
+)
+
+
+
 from aiohttp import web  # type: ignore
-from aiortc import RTCPeerConnection, RTCSessionDescription  # type: ignore
-from aiortc.contrib.media import MediaPlayer, MediaRelay  # type: ignore
+from aiortc import RTCSessionDescription  # type: ignore
 
 
-logger = logging.getLogger("visionedge.streaming")
+from streaming.peer import PeerManager
+from services.inference_loop import VisionPipeline
 
 
-pcs: set[RTCPeerConnection] = set()
-relay: MediaRelay | None = None
-player: MediaPlayer | None = None
+
+logger = logging.getLogger(
+    "visionedge.streaming"
+)
 
 
-async def index(request: web.Request) -> web.Response:
-    """
-    Serves static test HTML page.
-    """
 
-    html_path = Path(__file__).parent / "static" / "index.html"
+peer_manager = None
+pipeline = None
 
-    return web.Response(
-        content_type="text/html",
-        text=html_path.read_text()
+
+
+# =================================================
+# Serve frontend test page
+# =================================================
+
+async def index(request: web.Request):
+
+    html_path = (
+        Path(__file__).parent
+        / "static"
+        / "index.html"
     )
 
 
-async def offer(request: web.Request) -> web.Response:
-    """
-    Handles SDP offer and returns SDP answer.
-    """
+    return web.Response(
+
+        content_type="text/html",
+
+        text=html_path.read_text()
+
+    )
+
+
+
+# =================================================
+# WebRTC Offer Handler
+# =================================================
+
+async def offer(request: web.Request):
+
 
     params = await request.json()
 
+
+
     offer_desc = RTCSessionDescription(
+
         sdp=params["sdp"],
+
         type=params["type"]
+
     )
 
-    pc = RTCPeerConnection()
-    pcs.add(pc)
 
 
-    @pc.on("connectionstatechange")
-    async def on_connectionstatechange():
+    if peer_manager is None:
 
-        logger.info(
-            "Connection state is %s",
-            pc.connectionState
+        return web.Response(
+
+            status=500,
+
+            text="Peer manager not initialized"
+
         )
 
-        if pc.connectionState in ("failed", "closed"):
-            await pc.close()
-            pcs.discard(pc)
 
 
-    assert relay is not None
-    assert player is not None
+    pc = await peer_manager.create_peer_connection()
 
 
-    video_track = relay.subscribe(player.video)
 
-    pc.addTrack(video_track)
+    await pc.setRemoteDescription(
+        offer_desc
+    )
 
-
-    await pc.setRemoteDescription(offer_desc)
 
     answer = await pc.createAnswer()
 
-    await pc.setLocalDescription(answer)
+
+    await pc.setLocalDescription(
+        answer
+    )
+
 
 
     return web.Response(
+
         content_type="application/json",
+
         text=json.dumps(
+
             {
-                "sdp": pc.localDescription.sdp,
-                "type": pc.localDescription.type,
+
+                "sdp":
+                    pc.localDescription.sdp,
+
+                "type":
+                    pc.localDescription.type
+
             }
-        ),
+
+        )
+
     )
 
 
-async def on_shutdown(app: web.Application):
 
-    await asyncio.gather(
-        *[pc.close() for pc in pcs]
+# =================================================
+# Shutdown
+# =================================================
+
+async def on_shutdown(
+    app: web.Application
+):
+
+    if peer_manager:
+
+        await peer_manager.close_all()
+
+
+
+# =================================================
+# Build Application
+# =================================================
+
+def build_app(
+    video_source,
+    engine_path=None
+):
+
+    global peer_manager
+    global pipeline
+
+
+
+    logger.info(
+        "Initializing pipeline: %s",
+        video_source
     )
 
-    pcs.clear()
 
 
+    #
+    # AI Pipeline
+    #
 
-def build_app(video_path: str) -> web.Application:
+    pipeline = VisionPipeline(
 
-    global relay, player
+        video_source,
 
+        engine_path
 
-    relay = MediaRelay()
-
-    player = MediaPlayer(
-        video_path,
-        loop=True
     )
+
+
+
+    #
+    # WebRTC Manager
+    #
+
+    peer_manager = PeerManager(
+        pipeline
+    )
+
 
 
     app = web.Application()
 
 
-    app.on_shutdown.append(on_shutdown)
 
-
-    app.router.add_get("/", index)
-
-    app.router.add_post("/offer", offer)
-
-
-    app.router.add_static(
-        "/static/",
-        path=str(Path(__file__).parent / "static"),
-        name="static"
+    app.on_shutdown.append(
+        on_shutdown
     )
 
 
-    # CORS middleware
+
+    app.router.add_get(
+        "/",
+        index
+    )
+
+
+
+    app.router.add_post(
+        "/offer",
+        offer
+    )
+
+
+
+    app.router.add_static(
+
+        "/static/",
+
+        path=str(
+
+            Path(__file__).parent
+            /
+            "static"
+
+        ),
+
+        name="static"
+
+    )
+
+
+
+    # =================================================
+    # CORS
+    # =================================================
+
     @web.middleware
-    async def cors_middleware(request, handler):
+    async def cors_middleware(
+        request,
+        handler
+    ):
+
 
         if request.method == "OPTIONS":
+
             response = web.Response()
 
         else:
+
             response = await handler(request)
 
 
-        response.headers["Access-Control-Allow-Origin"] = "*"
 
-        response.headers["Access-Control-Allow-Methods"] = (
-            "POST, GET, OPTIONS"
-        )
+        response.headers[
 
-        response.headers["Access-Control-Allow-Headers"] = (
-            "Content-Type"
-        )
+            "Access-Control-Allow-Origin"
+
+        ] = "*"
+
+
+
+        response.headers[
+
+            "Access-Control-Allow-Methods"
+
+        ] = "POST, GET, OPTIONS"
+
+
+
+        response.headers[
+
+            "Access-Control-Allow-Headers"
+
+        ] = "Content-Type"
+
 
 
         return response
 
 
-    app.middlewares.append(cors_middleware)
+
+    app.middlewares.append(
+        cors_middleware
+    )
+
 
 
     return app
 
 
 
+# =================================================
+# Main
+# =================================================
+
 def main():
 
+
     logging.basicConfig(
-        level=logging.INFO
+
+        level=logging.INFO,
+
+        format="%(asctime)s %(levelname)s %(message)s"
+
     )
+
 
 
     parser = argparse.ArgumentParser(
+
         description="VisionEdge WebRTC server"
+
     )
 
 
+
     parser.add_argument(
+
         "--video",
+
         type=str,
+
         default=str(
-            Path(__file__).parents[2]
-            / "backend"
-            / "videos"
-            / "traffic video.mp4"
+
+            BACKEND_DIR
+
+            /
+
+            "videos"
+
+            /
+
+            "traffic video.mp4"
+
         ),
-        help="Video file path"
+
+        help="Video file path or RTSP URL"
+
     )
 
 
+
     parser.add_argument(
-        "--host",
+
+        "--engine",
+
         type=str,
-        default="0.0.0.0"
+
+        default=None,
+
+        help="TensorRT engine path"
+
     )
+
 
 
     parser.add_argument(
-        "--port",
-        type=int,
-        default=8080
+
+        "--host",
+
+        type=str,
+
+        default="0.0.0.0"
+
     )
+
+
+
+    parser.add_argument(
+
+        "--port",
+
+        type=int,
+
+        default=8080
+
+    )
+
 
 
     args = parser.parse_args()
 
 
-    if not Path(args.video).exists():
+
+    #
+    # Validate source
+    #
+
+    if (
+
+        not args.video.startswith("rtsp://")
+
+        and
+
+        not Path(args.video).exists()
+
+    ):
+
 
         raise SystemExit(
-            f"Video file not found: {args.video}\n"
-            "Provide a valid mp4 path."
+
+            f"Video source not found: {args.video}"
+
         )
 
 
-    app = build_app(args.video)
 
+    app = build_app(
 
-    web.run_app(
-        app,
-        host=args.host,
-        port=args.port
+        args.video,
+
+        args.engine
+
     )
 
 
 
+    logger.info(
+
+        "Starting WebRTC server on port %s",
+
+        args.port
+
+    )
+
+
+
+    web.run_app(
+
+        app,
+
+        host=args.host,
+
+        port=args.port
+
+    )
+
+
+
+
 if __name__ == "__main__":
+
     main()
